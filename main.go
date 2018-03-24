@@ -377,6 +377,10 @@ func (fc *FTPSession) Cancel() {
 	if fc.destContext != nil {
 		fc.destContext.Cancel()
 	}
+	if fc.remoteDataConn != nil {
+		fc.remoteDataConn.Close()
+		fc.remoteDataConn = nil
+	}
 	fc.canceled = true
 }
 
