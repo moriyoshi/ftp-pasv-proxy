@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"time"
 )
 
@@ -96,61 +95,56 @@ func readWithDeadline(r ReaderWithDeadline, buf []byte, dl time.Time) (n int, er
 	return
 }
 
-func cancelablReadInner(ctx context.Context, r ReaderWithDeadline, buf []byte, nowGetter func() time.Time) (n int, err error) {
-	for {
-		now := nowGetter()
-		select {
-		case <-ctx.Done():
-			dl, ok := ctx.Deadline()
-			if !ok || dl.IsZero() || dl.Sub(now) > time.Duration(0) {
-				err = canceled
-				return
-			} else {
-				err = &net.OpError{Op: "read", Err: timeoutError}
-			}
-			return
-		default:
-		}
-		n, err = readWithDeadline(r, buf, now.Add(tick))
-		if _err, ok := err.(interface{ Timeout() bool }); ok && _err.Timeout() {
-			continue
-		}
+func cancelablReadInner(ctx context.Context, r ReaderWithDeadline, buf []byte) (n int, err error) {
+	type readResult struct {
+		n   int
+		err error
+	}
+	resultAvailableChan := make(chan readResult)
+	go func() {
+		n, err := r.Read(buf)
+		resultAvailableChan <- readResult{n, err}
+	}()
+	select {
+	case <-ctx.Done():
+		r.SetReadDeadline(time.Unix(1, 0))
+		err = canceled
 		break
+	case result := <-resultAvailableChan:
+		n = result.n
+		err = result.err
 	}
 	return
 }
 
 func cancelableRead(ctx NowgettableContext, r ReaderWithDeadline, buf []byte) (int, error) {
-	return cancelablReadInner(ctx, r, buf, ctx.Now)
+	return cancelablReadInner(ctx, r, buf)
 }
 
 func cancelableReadWithDeadline(ctx NowgettableContext, r ReaderWithDeadline, buf []byte, dl time.Time) (int, error) {
-	_ctx, cancel := context.WithDeadline(ctx, dl)
-	defer cancel()
-	return cancelablReadInner(_ctx, r, buf, ctx.Now)
+	r.SetReadDeadline(dl)
+	return cancelablReadInner(ctx, r, buf)
 }
 
 func cancelableWriteWithDeadline(ctx NowgettableContext, w WriterWithDeadline, buf []byte, dl time.Time) (n int, err error) {
-	_ctx, cancel := context.WithDeadline(ctx, dl)
-	defer cancel()
-	for {
-		select {
-		case <-_ctx.Done():
-			dl, ok := _ctx.Deadline()
-			if !ok || dl.IsZero() || dl.Sub(ctx.Now()) > time.Duration(0) {
-				err = canceled
-				return
-			} else {
-				err = &net.OpError{Op: "read", Err: timeoutError}
-			}
-			return
-		default:
-		}
-		n, err = writeWithDeadline(w, buf, ctx.Now().Add(tick))
-		if _err, ok := err.(interface{ Timeout() bool }); ok && _err.Timeout() {
-			continue
-		}
+	type writeResult struct {
+		n   int
+		err error
+	}
+	w.SetWriteDeadline(dl)
+	resultAvailableChan := make(chan writeResult)
+	go func() {
+		n, err := w.Write(buf)
+		resultAvailableChan <- writeResult{n, err}
+	}()
+	select {
+	case <-ctx.Done():
+		w.SetWriteDeadline(time.Unix(1, 0))
+		err = canceled
 		break
+	case result := <-resultAvailableChan:
+		n = result.n
+		err = result.err
 	}
 	return
 }
