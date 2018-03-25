@@ -2,13 +2,15 @@ package main
 
 import (
 	"io"
+	"log"
 	"net"
+	"sync"
 	"time"
 )
 
 type FTPReaderContext struct {
 	parent   NowgettableContext
-	r        ReaderWithDeadline
+	r        *net.TCPConn
 	lr       LineReader
 	doneChan chan struct{}
 	dataChan chan *LineReader
@@ -36,12 +38,17 @@ func (rctx *FTPReaderContext) Cancel() {
 	rctx.running = false
 }
 
-func NewFTPReaderContext(parent NowgettableContext, r ReaderWithDeadline) *FTPReaderContext {
+func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderContext {
+	oobChan := make(chan []byte)
 	lr := LineReader{
 		r:      r,
 		buf:    make([]byte, 0, 1024),
 		offset: 0,
 		mark:   0,
+		tesc: func(b []byte) error {
+			oobChan <- b
+			return nil
+		},
 	}
 	rctx := &FTPReaderContext{
 		parent:   parent,
@@ -53,36 +60,45 @@ func NewFTPReaderContext(parent NowgettableContext, r ReaderWithDeadline) *FTPRe
 		running:  true,
 	}
 	go func() {
-	outer:
-		for rctx.running {
-			select {
-			case <-parent.Done():
-				break outer
-			default:
-			}
-			_err := r.SetReadDeadline(parent.Now().Add(readTimeout))
-			if _err != nil {
-				rctx.err = _err
-				break
-			}
-			_err = lr.Next()
-			if _err == nil {
+		defer func() {
+			log.Printf("FTPReaderContext (%p) is closing...", rctx)
+			close(rctx.doneChan)
+		}()
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			availChan := make(chan error)
+		outer:
+			for rctx.running {
+				go func() {
+					err := r.SetReadDeadline(parent.Now().Add(readTimeout))
+					if err != nil {
+						availChan <- err
+						return
+					}
+					availChan <- lr.Next()
+				}()
+				select {
+				case <-parent.Done():
+					r.SetReadDeadline(time.Unix(1, 0))
+					break outer
+				case _err := <-availChan:
+					if _err == io.EOF {
+						break outer
+					} else if _err != nil {
+						rctx.err = _err
+						break outer
+					}
+				}
 				select {
 				case <-parent.Done():
 					break outer
 				case rctx.dataChan <- &lr:
-					break
-				}
-			} else if _err == io.EOF {
-				break
-			} else {
-				if err, ok := (_err).(*net.OpError); !ok || (!err.Timeout() && !err.Temporary()) {
-					rctx.err = _err
-					break
 				}
 			}
-		}
-		close(rctx.doneChan)
+		}()
+		wg.Wait()
 	}()
 	return rctx
 }

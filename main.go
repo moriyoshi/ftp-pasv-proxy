@@ -32,8 +32,8 @@ type WriterWithDeadline interface {
 type NowGetter func() time.Time
 
 type FTPSession struct {
-	srcConn              net.Conn
-	destConn             net.Conn
+	srcConn              *net.TCPConn
+	destConn             *net.TCPConn
 	destAddr             IPAddrPortPair
 	srcContext           *FTPReaderContext
 	destContext          *FTPReaderContext
@@ -42,6 +42,7 @@ type FTPSession struct {
 	srcHandler           func() error
 	err                  error
 	doneChan             chan struct{}
+	finishChan           chan struct{}
 	nowGetter            NowGetter
 	dialer               net.Dialer
 	outboundCommandSpool [][]byte
@@ -54,7 +55,7 @@ type FTPReply struct {
 	Image   []byte
 }
 
-type ConnGenFunc func(ctx context.Context) (net.Conn, error)
+type ConnGenFunc func(ctx context.Context) (*net.TCPConn, error)
 
 var portPasvOctetsRegex = regexp.MustCompile("\\s*([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+),([0-9]+)\\s*")
 var statusRespRegex = regexp.MustCompile("(?s)^([0-9]{3})(\\s|-)\\s*(.+)\\z")
@@ -370,18 +371,9 @@ func (fc *FTPSession) Cancel() {
 	if fc.canceled {
 		return
 	}
-	log.Println("Session canceled")
-	if fc.srcContext != nil {
-		fc.srcContext.Cancel()
-	}
-	if fc.destContext != nil {
-		fc.destContext.Cancel()
-	}
-	if fc.remoteDataConn != nil {
-		fc.remoteDataConn.Close()
-		fc.remoteDataConn = nil
-	}
 	fc.canceled = true
+	close(fc.doneChan)
+	log.Println("Session canceled")
 }
 
 func (fc *FTPSession) flushSpooledCommands() error {
@@ -622,7 +614,7 @@ func (fc *FTPSession) startLocalRemoteProxy() error {
 			defer wg.Done()
 			defer cancel()
 			err := copyStream(ctx, fc.remoteDataConn, localConn)
-			if err != nil {
+			if err != nil && err != canceled {
 				log.Printf("%v\n", err)
 			}
 		}()
@@ -631,7 +623,7 @@ func (fc *FTPSession) startLocalRemoteProxy() error {
 			defer wg.Done()
 			defer cancel()
 			err := copyStream(ctx, localConn, fc.remoteDataConn)
-			if err != nil {
+			if err != nil && err != canceled {
 				log.Printf("%v\n", err)
 			}
 		}()
@@ -652,13 +644,13 @@ func (fc *FTPSession) start() {
 
 	wg.Add(1)
 	go func() {
-		defer fc.destContext.Cancel()
 		defer wg.Done()
 		replyParser := FTPReplyParser{}
 	outer:
 		for {
 			select {
 			case <-fc.destContext.Done():
+				fc.Cancel()
 				break outer
 			case fn := <-handlerFuncs.inboundFuncChangeChan:
 				log.Printf("Inbound func changed to %s\n", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name())
@@ -692,12 +684,12 @@ func (fc *FTPSession) start() {
 
 	wg.Add(1)
 	go func() {
-		defer fc.srcContext.Cancel()
 		defer wg.Done()
 	outer:
 		for {
 			select {
 			case <-fc.srcContext.Done():
+				fc.Cancel()
 				break outer
 			case fn := <-handlerFuncs.outboundFuncChangeChan:
 				log.Printf("Outbound func changed to %s\n", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name())
@@ -724,19 +716,21 @@ func (fc *FTPSession) start() {
 
 	go func() {
 		wg.Wait()
-		close(fc.doneChan)
+		fc.finishChan <- struct{}{}
 	}()
 }
 
-func newFTPSession(srcConn net.Conn, newDestFunc ConnGenFunc, nowGetter NowGetter) (fc *FTPSession) {
+func newFTPSession(srcConn *net.TCPConn, newDestFunc ConnGenFunc, nowGetter NowGetter) (fc *FTPSession) {
 	fc = &FTPSession{
-		srcConn:   srcConn,
-		err:       nil,
-		doneChan:  make(chan struct{}),
-		nowGetter: nowGetter,
-		dialer:    net.Dialer{},
+		srcConn:    srcConn,
+		err:        nil,
+		doneChan:   make(chan struct{}),
+		finishChan: make(chan struct{}),
+		nowGetter:  nowGetter,
+		dialer:     net.Dialer{},
 	}
 	fc.srcContext = NewFTPReaderContext(fc, srcConn)
+	log.Printf("FTPReaderContext (%p) created for requests\n", fc.srcContext)
 	destConn, err := newDestFunc(fc)
 	if err != nil {
 		_err := fc.sendReply(FTPReply{Code: 421, Message: []byte("Service Not Available")})
@@ -770,21 +764,21 @@ func newFTPSession(srcConn net.Conn, newDestFunc ConnGenFunc, nowGetter NowGette
 	fc.destAddr.Addr = *addr
 	fc.destAddr.Port = port
 	fc.destContext = NewFTPReaderContext(fc, destConn)
+	log.Printf("FTPReaderContext (%p) created for replies\n", fc.destContext)
 	fc.start()
 	return
 }
 
-func startServing(l net.Listener, connGen ConnGenFunc) error {
+func startServing(l *net.TCPListener, connGen ConnGenFunc) error {
 	for {
-		cn, err := l.Accept()
+		cn, err := l.AcceptTCP()
 		if err != nil {
 			return err
 		}
-		go func(n net.Conn) {
+		go func(n *net.TCPConn) {
 			log.Printf("Accepted new connection from %v\n", n.RemoteAddr())
 			fc := newFTPSession(n, connGen, time.Now)
-			defer fc.Cancel()
-			<-fc.Done()
+			<-fc.finishChan
 			log.Printf("FTP session with %v ended\n", n.RemoteAddr())
 			err = fc.Err()
 			if err != nil {
@@ -813,9 +807,13 @@ func main() {
 	dialer := net.Dialer{
 		Timeout: time.Duration(1000000000),
 	}
-	err = startServing(l, func(ctx context.Context) (net.Conn, error) {
+	err = startServing(l.(*net.TCPListener), func(ctx context.Context) (*net.TCPConn, error) {
 		log.Printf("Trying to connect to %v...\n", dest)
-		return dialer.DialContext(ctx, "tcp", dest)
+		conn, err := dialer.DialContext(ctx, "tcp", dest)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*net.TCPConn), err
 	})
 	if err != nil {
 		putError(err.Error())
