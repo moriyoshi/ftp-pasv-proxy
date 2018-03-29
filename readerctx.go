@@ -1,16 +1,16 @@
-// 
+//
 // Copyright 2018 Moriyoshi Koizumi
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to
 // deal in the Software without restriction, including without limitation the
 // rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
 // sell copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -18,7 +18,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-// 
+//
 
 package main
 
@@ -31,17 +31,22 @@ import (
 )
 
 type FTPReaderContext struct {
-	parent   NowgettableContext
-	r        *net.TCPConn
-	lr       LineReader
-	doneChan chan struct{}
-	dataChan chan *LineReader
-	err      error
-	running  bool
+	parent     NowgettableContext
+	r          *net.TCPConn
+	lr         LineReader
+	doneChan   chan struct{}
+	finishChan chan struct{}
+	dataChan   chan *LineReader
+	err        error
+	running    bool
 }
 
 func (rctx *FTPReaderContext) Done() <-chan struct{} {
 	return rctx.doneChan
+}
+
+func (rctx *FTPReaderContext) Finish() <-chan struct{} {
+	return rctx.finishChan
 }
 
 func (rctx *FTPReaderContext) Data() <-chan *LineReader {
@@ -57,7 +62,11 @@ func (rctx *FTPReaderContext) Value(interface{}) interface{} {
 }
 
 func (rctx *FTPReaderContext) Cancel() {
+	if !rctx.running {
+		return
+	}
 	rctx.running = false
+	close(rctx.doneChan)
 }
 
 func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderContext {
@@ -73,18 +82,19 @@ func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderCo
 		},
 	}
 	rctx := &FTPReaderContext{
-		parent:   parent,
-		r:        r,
-		lr:       lr,
-		doneChan: make(chan struct{}),
-		dataChan: make(chan *LineReader),
-		err:      nil,
-		running:  true,
+		parent:     parent,
+		r:          r,
+		lr:         lr,
+		doneChan:   make(chan struct{}),
+		dataChan:   make(chan *LineReader),
+		finishChan: make(chan struct{}),
+		err:        nil,
+		running:    true,
 	}
 	go func() {
 		defer func() {
-			log.Printf("FTPReaderContext (%p) is closing...", rctx)
-			close(rctx.doneChan)
+			log.Printf("FTPReaderContext (%p) is closing...\n", rctx)
+			close(rctx.finishChan)
 		}()
 		wg := sync.WaitGroup{}
 		wg.Add(1)
@@ -92,7 +102,7 @@ func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderCo
 			defer wg.Done()
 			availChan := make(chan error)
 		outer:
-			for rctx.running {
+			for {
 				go func() {
 					err := r.SetReadDeadline(parent.Now().Add(readTimeout))
 					if err != nil {
@@ -103,6 +113,8 @@ func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderCo
 				}()
 				select {
 				case <-parent.Done():
+					rctx.Cancel()
+				case <-rctx.doneChan:
 					r.SetReadDeadline(time.Unix(1, 0))
 					break outer
 				case _err := <-availChan:
@@ -113,10 +125,17 @@ func NewFTPReaderContext(parent NowgettableContext, r *net.TCPConn) *FTPReaderCo
 						break outer
 					}
 				}
-				select {
-				case <-parent.Done():
-					break outer
-				case rctx.dataChan <- &lr:
+				for {
+					select {
+					case <-parent.Done():
+						rctx.Cancel()
+						continue
+					case <-rctx.doneChan:
+						r.SetReadDeadline(time.Unix(1, 0))
+						break outer
+					case rctx.dataChan <- &lr:
+					}
+					break
 				}
 			}
 		}()

@@ -1,16 +1,16 @@
-// 
+//
 // Copyright 2018 Moriyoshi Koizumi
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to
 // deal in the Software without restriction, including without limitation the
 // rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
 // sell copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -18,7 +18,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-// 
+//
 
 package main
 
@@ -40,16 +40,6 @@ import (
 
 	"github.com/pkg/errors"
 )
-
-type ReaderWithDeadline interface {
-	io.Reader
-	SetReadDeadline(t time.Time) error
-}
-
-type WriterWithDeadline interface {
-	io.Writer
-	SetWriteDeadline(t time.Time) error
-}
 
 type NowGetter func() time.Time
 
@@ -377,6 +367,11 @@ func (fc *FTPSession) Err() error {
 func (fc *FTPSession) Done() <-chan struct{} {
 	return fc.doneChan
 }
+
+func (fc *FTPSession) Finish() <-chan struct{} {
+	return fc.finishChan
+}
+
 func (fc *FTPSession) Deadline() (time.Time, bool) {
 	return time.Time{}, false
 }
@@ -440,7 +435,7 @@ func handleInboundPreAuth(fc *FTPSession, fns *handlerFuncs, rep FTPReply) error
 	if err != nil {
 		return err
 	}
-	if rep.Code == 230 || rep.Code == 530 {
+	if rep.Code == 230 {
 		fns.setInbound(handleInboundPassthru)
 		fns.setOutbound(handleOutboundPostAuth)
 		return nil
@@ -483,6 +478,9 @@ func handleInboundPasv(fc *FTPSession, fns *handlerFuncs, rep FTPReply) error {
 		return nil
 	default:
 		_, err := writeWithDeadline(fc.srcConn, rep.Image, fc.Now().Add(writeTimeout))
+		fns.setInbound(handleInboundPassthru)
+		fns.setOutbound(handleOutboundPostAuth)
+		fc.flushSpooledCommands()
 		if err != nil {
 			return err
 		}
@@ -655,7 +653,15 @@ func (fc *FTPSession) startLocalRemoteProxy() error {
 	return nil
 }
 
-func (fc *FTPSession) start() {
+func newFTPSession(srcConn *net.TCPConn, newDestFunc ConnGenFunc, nowGetter NowGetter) (fc *FTPSession) {
+	fc = &FTPSession{
+		srcConn:    srcConn,
+		err:        nil,
+		doneChan:   make(chan struct{}),
+		finishChan: make(chan struct{}),
+		nowGetter:  nowGetter,
+		dialer:     net.Dialer{},
+	}
 	wg := sync.WaitGroup{}
 	handlerFuncs := handlerFuncs{
 		make(chan inboundHandlerFunc, 1),
@@ -665,52 +671,28 @@ func (fc *FTPSession) start() {
 	}
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		replyParser := FTPReplyParser{}
-	outer:
-		for {
-			select {
-			case <-fc.destContext.Done():
-				fc.Cancel()
-				break outer
-			case fn := <-handlerFuncs.inboundFuncChangeChan:
-				log.Printf("Inbound func changed to %s\n", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name())
-				handlerFuncs.inbound = fn
-				break
-			case lr := <-fc.destContext.Data():
-				if lr == nil {
-					break
-				}
-				ok, err := replyParser.Feed(lr)
-				if err != nil {
-					fc.err = err
-					fc.Cancel()
-					continue
-				}
-				if !ok {
-					continue
-				}
-				if handlerFuncs.inbound != nil {
-					log.Printf("<<< %s", replyParser.Reply.Image)
-					err := handlerFuncs.inbound(fc, &handlerFuncs, replyParser.Reply)
-					if err != nil {
-						fc.err = err
-						log.Printf("--- %v\n", err)
-						fc.Cancel()
-					}
-				}
-			}
-		}
-	}()
+	defer wg.Done()
 
+	go func() {
+		wg.Wait()
+		if fc.srcConn != nil {
+			fc.srcConn.Close()
+			log.Printf("Connection with %s closed.\n", fc.srcConn.RemoteAddr().String())
+		}
+		if fc.destConn != nil {
+			fc.destConn.Close()
+			log.Printf("Connection with %s closed.\n", fc.destConn.RemoteAddr().String())
+		}
+		fc.finishChan <- struct{}{}
+	}()
+	fc.srcContext = NewFTPReaderContext(fc, srcConn)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 	outer:
 		for {
 			select {
-			case <-fc.srcContext.Done():
+			case <-fc.srcContext.Finish():
 				fc.Cancel()
 				break outer
 			case fn := <-handlerFuncs.outboundFuncChangeChan:
@@ -735,23 +717,6 @@ func (fc *FTPSession) start() {
 			}
 		}
 	}()
-
-	go func() {
-		wg.Wait()
-		fc.finishChan <- struct{}{}
-	}()
-}
-
-func newFTPSession(srcConn *net.TCPConn, newDestFunc ConnGenFunc, nowGetter NowGetter) (fc *FTPSession) {
-	fc = &FTPSession{
-		srcConn:    srcConn,
-		err:        nil,
-		doneChan:   make(chan struct{}),
-		finishChan: make(chan struct{}),
-		nowGetter:  nowGetter,
-		dialer:     net.Dialer{},
-	}
-	fc.srcContext = NewFTPReaderContext(fc, srcConn)
 	log.Printf("FTPReaderContext (%p) created for requests\n", fc.srcContext)
 	destConn, err := newDestFunc(fc)
 	if err != nil {
@@ -786,8 +751,46 @@ func newFTPSession(srcConn *net.TCPConn, newDestFunc ConnGenFunc, nowGetter NowG
 	fc.destAddr.Addr = *addr
 	fc.destAddr.Port = port
 	fc.destContext = NewFTPReaderContext(fc, destConn)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		replyParser := FTPReplyParser{}
+	outer:
+		for {
+			select {
+			case <-fc.destContext.Finish():
+				fc.Cancel()
+				break outer
+			case fn := <-handlerFuncs.inboundFuncChangeChan:
+				log.Printf("Inbound func changed to %s\n", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name())
+				handlerFuncs.inbound = fn
+				break
+			case lr := <-fc.destContext.Data():
+				if lr == nil {
+					break
+				}
+				ok, err := replyParser.Feed(lr)
+				if err != nil {
+					fc.err = err
+					fc.Cancel()
+					continue
+				}
+				if !ok {
+					continue
+				}
+				if handlerFuncs.inbound != nil {
+					log.Printf("<<< %s", replyParser.Reply.Image)
+					err := handlerFuncs.inbound(fc, &handlerFuncs, replyParser.Reply)
+					if err != nil {
+						fc.err = err
+						log.Printf("--- %v\n", err)
+						fc.Cancel()
+					}
+				}
+			}
+		}
+	}()
 	log.Printf("FTPReaderContext (%p) created for replies\n", fc.destContext)
-	fc.start()
 	return
 }
 
@@ -800,7 +803,7 @@ func startServing(l *net.TCPListener, connGen ConnGenFunc) error {
 		go func(n *net.TCPConn) {
 			log.Printf("Accepted new connection from %v\n", n.RemoteAddr())
 			fc := newFTPSession(n, connGen, time.Now)
-			<-fc.finishChan
+			<-fc.Finish()
 			log.Printf("FTP session with %v ended\n", n.RemoteAddr())
 			err = fc.Err()
 			if err != nil {
